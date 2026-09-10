@@ -157,13 +157,16 @@ jobs:
                 || { echo "::error::the clean soak did not pass (exit $STATUS) -- see verdict.txt"; exit 1; }
               ;;
             leak-resultset)
-              # 2 is "finished the window and failed a threshold", which for a deliberately
-              # abandoned result set has to be the handle slope. Any other code means the
-              # harness caught it for the wrong reason, or did not catch it.
+              # 2 is "finished the window and failed a threshold", and for a deliberately
+              # abandoned result set the threshold has to be one of the three that a leak moves:
+              # the handle slope, the handle count at the end, or the memory ceiling. Checking
+              # the reason and not only the code is the point -- any exit 2 would otherwise pass
+              # this, including one from a threshold that has nothing to do with the fault.
               [ "$STATUS" = 2 ] \
-                || { echo "::error::a leaked ResultSet was not caught by the handle slope (exit $STATUS)"; exit 1; }
-              grep -q 'native handle slope' target/soak-out/verdict.txt \
-                || { echo "::error::the run failed, but not on the handle slope"; exit 1; }
+                || { echo "::error::a leaked ResultSet was not caught (exit $STATUS)"; exit 1; }
+              grep -qE 'native handle slope|handles did not return to zero|ceiling rose' \
+                   target/soak-out/verdict.txt \
+                || { echo "::error::the run failed, but not on anything a leak moves"; exit 1; }
               ;;
             stall-worker|deadlock)
               # 3 is "the watchdog reported a stall and dumped every thread".

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # The concurrent soak of work plan section 5.11: several connections on several threads
-# running a mixed workload for hours, with the memory slope recorded across it.
+# running a mixed workload for hours, with the memory trend recorded across it.
 #
 # Why this exists when two proxies already do half of it each. The 1000-query RSS plateau is
 # long but sequential, so it measures the allocator and nothing else; HikariPoolIT is
@@ -38,11 +38,20 @@
 #   live threads        A driver that leaked a thread per statement would plateau in RSS and
 #                       still be broken.
 #
-# What it asserts at the end, and why it is a slope and not a level. The engine warms up: it
-# faults in its image, fills mark and uncompressed caches and settles. An absolute ceiling
-# would either be so high it catches nothing or so low it fails on warm-up. So the regression
-# runs over the last 80% of the window -- 12 minutes of warm-up excluded from an hour -- and
-# only the positive side is asserted, because memory going back to the OS is not a leak.
+# What it asserts at the end. Everything is judged over the last 80% of the window, because the
+# engine warms up in the first fifth -- it faults in its image, fills mark and uncompressed
+# caches and settles -- and a statistic that includes warm-up measures warm-up.
+#
+# For memory the statistic is whether the *ceiling* rises: the highest value in the first half
+# of that window against the highest in the second. Not a slope, which is what this asserted
+# first and which failed a clean 75-minute run at +93 MB/h while RSS over the same window fell
+# at 69 MB/h. phys_footprint here oscillates inside a 130 MB band with a period of about twenty
+# minutes, so a least squares fit over a window of comparable length says whatever its endpoints
+# want it to. SoakProbe.judgeMemory has the three-window demonstration and the numbers that
+# separate a clean run from an injected leak. Slopes are still printed, as diagnostics.
+#
+# For handles the statistic is the slope, because a handle count is a small integer with no
+# cache behind it to oscillate, plus a hard check that every handle is back to zero at the end.
 #
 # Deadlock detection is a progress counter per worker, not the total run timeout. A run that
 # hangs and is killed by its own deadline tells you that it hung; it does not tell you where.
@@ -55,8 +64,8 @@
 #
 # Faults, for the only thing that makes a clean soak worth anything: proof that a dirty one
 # goes red. --fault leak-resultset abandons one ResultSet every 40 iterations, which the handle
-# slope has to catch; --fault stall-worker parks a worker forever mid-statement, which the
-# progress watchdog has to catch; --fault deadlock crosses two monitors between two workers,
+# slope and the memory ceiling have to catch; --fault stall-worker parks a worker forever, which
+# only the progress watchdog can catch; --fault deadlock crosses two monitors between workers,
 # which findDeadlockedThreads has to catch. All three are expected to fail the run.
 #
 # Not in per-PR CI. An hour-long job on every push would make the pipeline useless, so this is
@@ -66,12 +75,14 @@
 #   scripts/run-soak-test.sh [--minutes N] [--threads N] [--sample-seconds N]
 #                            [--stall-seconds N] [--fault none|leak-resultset|stall-worker|deadlock]
 #                            [--url JDBC-URL] [--out DIR] [--runtime DIR] [--jvm PATH]
-#                            [--max-rss-slope MB/h] [--max-footprint-slope MB/h]
-#                            [--max-handle-slope N/h]
+#                            [--max-ceiling-rise MB] [--max-handle-slope N/h]
+#   scripts/run-soak-test.sh --analyze <dir-or-samples.csv>
 #
 # Leaves samples.csv, verdict.txt, run.properties, soak.log and, on a stall, stall-report.txt
 # in the output directory. samples.csv is a plain time series with a header, flushed every
-# sample, so a run that is killed still leaves everything it measured.
+# sample, so a run that is killed still leaves everything it measured -- and --analyze re-judges
+# a recorded one against today's thresholds without running anything, which is what makes an
+# uploaded CI artifact worth keeping.
 
 set -euo pipefail
 
@@ -89,9 +100,9 @@ OUT=""
 RUNTIME=""
 JVM=""
 XMX=512m
-MAX_RSS_SLOPE=25
-MAX_FOOTPRINT_SLOPE=25
+MAX_CEILING_RISE=32
 MAX_HANDLE_SLOPE=0.5
+ANALYZE=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -105,9 +116,9 @@ while [ $# -gt 0 ]; do
     --runtime) RUNTIME="$2"; shift 2 ;;
     --jvm) JVM="$2"; shift 2 ;;
     --xmx) XMX="$2"; shift 2 ;;
-    --max-rss-slope) MAX_RSS_SLOPE="$2"; shift 2 ;;
-    --max-footprint-slope) MAX_FOOTPRINT_SLOPE="$2"; shift 2 ;;
+    --max-ceiling-rise) MAX_CEILING_RISE="$2"; shift 2 ;;
     --max-handle-slope) MAX_HANDLE_SLOPE="$2"; shift 2 ;;
+    --analyze) ANALYZE="$2"; shift 2 ;;
     -h|--help) sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option $1 (try --help)" ;;
   esac
@@ -205,8 +216,7 @@ public final class SoakProbe {
     private static String fault = "none";
     private static String url = "jdbc:chdb::memory:";
     private static Path out;
-    private static double maxRssSlopeMbPerHour;
-    private static double maxFootprintSlopeMbPerHour;
+    private static double maxCeilingRiseMb;
     private static double maxHandleSlopePerHour;
 
     /** Refuse to call a run clean on too little evidence. See {@link #verdict}. */
@@ -983,6 +993,14 @@ public final class SoakProbe {
         double last;
         double min;
         double max;
+
+        /** Highest value in the first half of the fit window, and in the second. */
+        double ceilingFirstHalf;
+        double ceilingSecondHalf;
+
+        double ceilingRise() {
+            return ceilingSecondHalf - ceilingFirstHalf;
+        }
     }
 
     /**
@@ -1021,6 +1039,18 @@ public final class SoakProbe {
         result.slopePerHour = denominator == 0 ? 0 : (n * sumXY - sumX * sumY) / denominator * 3600.0;
         result.first = series.get(from)[1];
         result.last = series.get(series.size() - 1)[1];
+
+        // The ceiling of each half of the fit window. This, and not the slope, is what the
+        // memory series are judged on -- see "Why the ceiling and not the slope" below.
+        int middle = from + n / 2;
+        result.ceilingFirstHalf = -Double.MAX_VALUE;
+        result.ceilingSecondHalf = -Double.MAX_VALUE;
+        for (int i = from; i < middle; i++) {
+            result.ceilingFirstHalf = Math.max(result.ceilingFirstHalf, series.get(i)[1]);
+        }
+        for (int i = middle; i < series.size(); i++) {
+            result.ceilingSecondHalf = Math.max(result.ceilingSecondHalf, series.get(i)[1]);
+        }
         return result;
     }
 
@@ -1043,12 +1073,80 @@ public final class SoakProbe {
         return points;
     }
 
+    /**
+     * The memory and handle criteria, applied to a set of fits.
+     *
+     * <h2>Why the ceiling and not the slope</h2>
+     * The first version of this asserted a least squares slope over the fit window, and the
+     * first 75-minute run failed it at +93.42 MB/h of {@code phys_footprint} — while RSS over
+     * the same window fell at 68.88 MB/h and the handle count was flat. The series turned out
+     * to be a bounded oscillation, not a trend: over 75 minutes {@code phys_footprint} moved
+     * inside 466–593 MB with a period of roughly twenty minutes, so the fitted slope depends
+     * entirely on where the window happens to start and stop. Same data, three windows:
+     *
+     * <pre>
+     *   whole run    +46.48 MB/h
+     *   last 80%     +93.42 MB/h      &lt;- what the run was failed on
+     *   last 50%     -68.16 MB/h      &lt;- the opposite conclusion
+     * </pre>
+     *
+     * A least squares fit is the wrong statistic for a signal whose period is comparable to the
+     * window. The ceiling is the right one, because a leak and an oscillation differ in exactly
+     * that respect: an oscillation has a ceiling and a leak does not. Highest value in the first
+     * half of the fit window against the highest in the second, same data:
+     *
+     * <pre>
+     *   75-minute clean run     rss  -12.4 MB   phys_footprint   +3.9 MB   handles  +1
+     *   10-minute clean run     rss   +0.2 MB   phys_footprint  -34.2 MB   handles  +2
+     *   10-minute leak fault    rss  +51.1 MB   phys_footprint +234.1 MB   handles +41
+     * </pre>
+     *
+     * Which is a clean separation and, unlike the slope, one that does not depend on window
+     * placement. The default threshold of 32 MB sits eight times above the clean measurement
+     * and seven times below the fault. At the throughput measured — 482,442 iterations in 75
+     * minutes — it still catches a leak of about 70 bytes per iteration.
+     *
+     * <p>The slopes are still computed and printed, because they are the right first thing to
+     * look at when something has moved. They are diagnostics, not the gate.
+     *
+     * <p>Handles are the exception and keep their slope, because a handle count is a small
+     * integer with no cache behind it to oscillate: the clean runs fit at +0.27/h and the leak
+     * fault at +535.89/h. The end-of-run "back to zero" check does most of the work anyway; the
+     * slope is what catches a leak that something else happens to clean up before the end.
+     */
+    private static void judgeMemory(List<String> failures, Fit rss, Fit footprint, Fit handles) {
+        if (rss.points >= 4 && rss.ceilingRise() / 1048576.0 > maxCeilingRiseMb) {
+            failures.add(String.format(
+                    Locale.ROOT,
+                    "the rss ceiling rose %.2f MB across the window, above the %.2f MB threshold"
+                            + " (%.1f MB -> %.1f MB)",
+                    rss.ceilingRise() / 1048576.0, maxCeilingRiseMb,
+                    rss.ceilingFirstHalf / 1048576.0, rss.ceilingSecondHalf / 1048576.0));
+        }
+        if (footprint.points >= 4 && footprint.ceilingRise() / 1048576.0 > maxCeilingRiseMb) {
+            failures.add(String.format(
+                    Locale.ROOT,
+                    "the phys_footprint ceiling rose %.2f MB across the window, above the %.2f MB"
+                            + " threshold (%.1f MB -> %.1f MB)",
+                    footprint.ceilingRise() / 1048576.0, maxCeilingRiseMb,
+                    footprint.ceilingFirstHalf / 1048576.0, footprint.ceilingSecondHalf / 1048576.0));
+        }
+        if (handles.slopePerHour > maxHandleSlopePerHour) {
+            failures.add(String.format(
+                    Locale.ROOT, "native handle slope %.2f/h is above the %.2f/h threshold",
+                    handles.slopePerHour, maxHandleSlopePerHour));
+        }
+    }
+
     private static String describeFit(String label, Fit f, double divisor, String unit) {
         return String.format(
                 Locale.ROOT,
-                "  %-18s %4d points  slope %+9.2f %s/h   first %9.2f  last %9.2f  min %9.2f  max %9.2f",
+                "  %-16s %4d pts  slope %+9.2f %s/h  ceiling %8.2f -> %8.2f (%+8.2f)"
+                        + "  min %8.2f  max %8.2f",
                 label, f.points, f.slopePerHour / divisor, unit,
-                f.first / divisor, f.last / divisor,
+                (f.ceilingFirstHalf == -Double.MAX_VALUE ? 0 : f.ceilingFirstHalf) / divisor,
+                (f.ceilingSecondHalf == -Double.MAX_VALUE ? 0 : f.ceilingSecondHalf) / divisor,
+                f.ceilingRise() / divisor,
                 (f.min == Double.MAX_VALUE ? 0 : f.min) / divisor,
                 (f.max == -Double.MAX_VALUE ? 0 : f.max) / divisor);
     }
@@ -1147,23 +1245,7 @@ public final class SoakProbe {
             failures.add("native handles did not return to zero: " + finalConnection + " connection, "
                     + finalResult + " result, " + finalStream + " stream");
         }
-        // Only the positive side: memory handed back to the OS is not a leak.
-        if (rss.slopePerHour / 1048576.0 > maxRssSlopeMbPerHour) {
-            failures.add(String.format(
-                    Locale.ROOT, "rss slope %.2f MB/h is above the %.2f MB/h threshold",
-                    rss.slopePerHour / 1048576.0, maxRssSlopeMbPerHour));
-        }
-        if (footprint.points >= 2
-                && footprint.slopePerHour / 1048576.0 > maxFootprintSlopeMbPerHour) {
-            failures.add(String.format(
-                    Locale.ROOT, "phys_footprint slope %.2f MB/h is above the %.2f MB/h threshold",
-                    footprint.slopePerHour / 1048576.0, maxFootprintSlopeMbPerHour));
-        }
-        if (handles.slopePerHour > maxHandleSlopePerHour) {
-            failures.add(String.format(
-                    Locale.ROOT, "native handle slope %.2f/h is above the %.2f/h threshold",
-                    handles.slopePerHour, maxHandleSlopePerHour));
-        }
+        judgeMemory(failures, rss, footprint, handles);
 
         text.append('\n');
         if (failures.isEmpty()) {
@@ -1188,6 +1270,80 @@ public final class SoakProbe {
         return failures.isEmpty() ? 0 : 2;
     }
 
+    // ---------------------------------------------------------------- after the fact
+
+    /**
+     * Re-judges a {@code samples.csv} from a finished run, without running one.
+     *
+     * <p>Exists because the series is the evidence and the criterion is a judgement about it,
+     * and those two things change on different schedules. A CI artifact from three weeks ago can
+     * be re-read against today's thresholds; a run whose criterion turned out to be the wrong
+     * statistic — which is what happened to the first 75-minute window, see {@link
+     * #judgeMemory} — does not have to be repeated to find out what the right one says about it.
+     *
+     * <p>It judges only what the file contains: the memory and handle criteria. Outcome counts,
+     * the shape coverage check and the end-of-run handle count are properties of a live run and
+     * are reported as not checked rather than silently passed.
+     */
+    private static int analyze(Path directory) throws IOException {
+        Path csv = Files.isDirectory(directory) ? directory.resolve("samples.csv") : directory;
+        List<String> lines = Files.readAllLines(csv, StandardCharsets.UTF_8);
+        if (lines.size() < 2) {
+            System.out.println("VERDICT=failed  " + csv + " has no samples");
+            return 2;
+        }
+        for (String line : lines.subList(1, lines.size())) {
+            String[] f = line.split(",");
+            if (f.length < 9) {
+                continue;
+            }
+            Sample sample = new Sample();
+            sample.elapsedSeconds = Long.parseLong(f[0].trim());
+            sample.rss = Long.parseLong(f[1].trim());
+            sample.footprint = Long.parseLong(f[2].trim());
+            sample.heapUsed = Long.parseLong(f[3].trim());
+            sample.handlesConnection = Long.parseLong(f[4].trim());
+            sample.handlesResult = Long.parseLong(f[5].trim());
+            sample.handlesStream = Long.parseLong(f[6].trim());
+            sample.liveThreads = Integer.parseInt(f[7].trim());
+            sample.iterations = Long.parseLong(f[8].trim());
+            samples.add(sample);
+        }
+
+        Fit rss = fit(series(0));
+        Fit footprint = fit(series(1));
+        Fit heap = fit(series(2));
+        Fit handles = fit(series(3));
+        StringBuilder text = new StringBuilder();
+        text.append("re-analysing ").append(csv).append(", ").append(samples.size())
+                .append(" samples, ceiling threshold ").append(maxCeilingRiseMb)
+                .append(" MB, handle slope threshold ").append(maxHandleSlopePerHour)
+                .append("/h\n\n=== slope and ceiling over the last 80% of the window ===\n");
+        text.append(describeFit("rss MB", rss, 1048576.0, "MB")).append('\n');
+        text.append(describeFit("phys_footprint MB", footprint, 1048576.0, "MB")).append('\n');
+        text.append(describeFit("heap used MB", heap, 1048576.0, "MB")).append('\n');
+        text.append(describeFit("native handles", handles, 1.0, "handles")).append('\n');
+
+        List<String> failures = new ArrayList<>();
+        if (samples.size() < MIN_SAMPLES) {
+            failures.add("only " + samples.size() + " samples; a fit needs at least " + MIN_SAMPLES);
+        }
+        judgeMemory(failures, rss, footprint, handles);
+
+        text.append("\nnot checked, because a recorded series cannot answer them: outcome counts,"
+                + " shape coverage, unexpected failures, handles after close\n\n");
+        if (failures.isEmpty()) {
+            text.append("VERDICT=clean (memory and handles only)\n");
+        } else {
+            text.append("VERDICT=failed\n");
+            for (String failure : failures) {
+                text.append("  - ").append(failure).append('\n');
+            }
+        }
+        System.out.print(text);
+        return failures.isEmpty() ? 0 : 2;
+    }
+
     // ---------------------------------------------------------------- entry point
 
     public static void main(String[] args) throws Exception {
@@ -1202,9 +1358,13 @@ public final class SoakProbe {
         fault = options.getOrDefault("--fault", "none");
         url = options.getOrDefault("--url", "jdbc:chdb::memory:");
         out = Paths.get(options.getOrDefault("--out", "target/soak"));
-        maxRssSlopeMbPerHour = Double.parseDouble(options.getOrDefault("--max-rss-slope", "25"));
-        maxFootprintSlopeMbPerHour = Double.parseDouble(options.getOrDefault("--max-footprint-slope", "25"));
+        maxCeilingRiseMb = Double.parseDouble(options.getOrDefault("--max-ceiling-rise", "32"));
         maxHandleSlopePerHour = Double.parseDouble(options.getOrDefault("--max-handle-slope", "0.5"));
+
+        if (options.containsKey("--analyze")) {
+            System.exit(analyze(Paths.get(options.get("--analyze"))));
+        }
+
         Files.createDirectories(out);
 
         System.out.printf(
@@ -1297,8 +1457,13 @@ JAVA
 
 # --------------------------------------------------------------------------------- setup
 
-[ -f "${RUNTIME}/libchdb.so" ] || die "no engine in ${RUNTIME}; build the platform package first
+# --analyze reads a file and calls no native method, so it needs the classpath and the probe but
+# not the engine. Checking for one would refuse to re-read a CI artifact on a machine that has
+# never built the shim, which is most of the machines anyone would want to read it on.
+if [ -z "$ANALYZE" ]; then
+  [ -f "${RUNTIME}/libchdb.so" ] || die "no engine in ${RUNTIME}; build the platform package first
   mvn -pl chdb-jdbc -am compile && scripts/build-native.sh ${DEFAULT_PLATFORM}"
+fi
 [ -x "$JAVA_BIN" ] || command -v "$JAVA_BIN" >/dev/null 2>&1 || die "no java at ${JAVA_BIN}"
 
 if [ -z "$OUT" ]; then
@@ -1347,6 +1512,15 @@ printf '%s\n' "$CP" | tr ':' '\n' | sed 's/^/  /'
 printf 'run-soak-test: compiling the probe\n'
 "$JAVAC_BIN" --release 11 -Xlint:-options -cp "$CP" -d "$PROBE" "${PROBE}/SoakProbe.java"
 
+# --------------------------------------------------------------------------------- analyze
+
+if [ -n "$ANALYZE" ]; then
+  exec "$JAVA_BIN" -cp "${CP}:${PROBE}" SoakProbe \
+    --analyze "$ANALYZE" \
+    --max-ceiling-rise "$MAX_CEILING_RISE" \
+    --max-handle-slope "$MAX_HANDLE_SLOPE"
+fi
+
 # --------------------------------------------------------------------------------- run
 
 printf 'run-soak-test: engine\n'
@@ -1371,8 +1545,7 @@ set +e
   --fault "$FAULT" \
   --url "$URL" \
   --out "$OUT" \
-  --max-rss-slope "$MAX_RSS_SLOPE" \
-  --max-footprint-slope "$MAX_FOOTPRINT_SLOPE" \
+  --max-ceiling-rise "$MAX_CEILING_RISE" \
   --max-handle-slope "$MAX_HANDLE_SLOPE" \
   2>&1 | tee "${OUT}/soak.log"
 STATUS=${PIPESTATUS[0]}
