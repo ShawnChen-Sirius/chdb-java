@@ -76,6 +76,7 @@
 #                            [--stall-seconds N] [--fault none|leak-resultset|stall-worker|deadlock]
 #                            [--url JDBC-URL] [--out DIR] [--runtime DIR] [--jvm PATH]
 #                            [--max-ceiling-rise MB] [--max-handle-slope N/h]
+#                            [--max-handle-ceiling-rise N]
 #   scripts/run-soak-test.sh --analyze <dir-or-samples.csv>
 #
 # Leaves samples.csv, verdict.txt, run.properties, soak.log and, on a stall, stall-report.txt
@@ -101,7 +102,8 @@ RUNTIME=""
 JVM=""
 XMX=512m
 MAX_CEILING_RISE=32
-MAX_HANDLE_SLOPE=0.5
+MAX_HANDLE_SLOPE=25
+MAX_HANDLE_CEILING_RISE=16
 ANALYZE=""
 
 while [ $# -gt 0 ]; do
@@ -118,6 +120,7 @@ while [ $# -gt 0 ]; do
     --xmx) XMX="$2"; shift 2 ;;
     --max-ceiling-rise) MAX_CEILING_RISE="$2"; shift 2 ;;
     --max-handle-slope) MAX_HANDLE_SLOPE="$2"; shift 2 ;;
+    --max-handle-ceiling-rise) MAX_HANDLE_CEILING_RISE="$2"; shift 2 ;;
     --analyze) ANALYZE="$2"; shift 2 ;;
     -h|--help) sed -n '/^# Usage:/,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown option $1 (try --help)" ;;
@@ -218,6 +221,7 @@ public final class SoakProbe {
     private static Path out;
     private static double maxCeilingRiseMb;
     private static double maxHandleSlopePerHour;
+    private static double maxHandleCeilingRise;
 
     /** Refuse to call a run clean on too little evidence. See {@link #verdict}. */
     private static final int MIN_SAMPLES = 12;
@@ -1109,10 +1113,34 @@ public final class SoakProbe {
      * <p>The slopes are still computed and printed, because they are the right first thing to
      * look at when something has moved. They are diagnostics, not the gate.
      *
-     * <p>Handles are the exception and keep their slope, because a handle count is a small
-     * integer with no cache behind it to oscillate: the clean runs fit at +0.27/h and the leak
-     * fault at +535.89/h. The end-of-run "back to zero" check does most of the work anyway; the
-     * slope is what catches a leak that something else happens to clean up before the end.
+     * <h2>The handle thresholds, which were wrong for the same reason</h2>
+     * The handle slope started at 0.50/h — "half a handle an hour, surely generous" — and a
+     * clean 66-minute run failed it at +0.53/h with every other signal healthy and the handle
+     * count back to zero at the end. The live count is not a monotone quantity either: the pool
+     * opens and evicts connections on its own schedule, so it wanders between 7 and 17 across a
+     * window. For a counter swinging by ten over fifty minutes with 69 samples, one standard
+     * error on the fitted slope is about 1.4/h, so a 0.50/h threshold sits well inside the
+     * statistic's own noise and was always going to flake.
+     *
+     * <p>Measured instead, over the fit window of every run long enough to fit:
+     *
+     * <pre>
+     *   clean, 66 minutes     slope +0.53/h    ceiling 14 -&gt; 17  (+3)
+     *   clean, 75 minutes     slope +0.27/h    ceiling 15 -&gt; 16  (+1)
+     *   clean, 10 minutes     slope -10.24/h   ceiling  (+2)
+     *   leak fault, run 1     slope +410.19/h  ceiling 55 -&gt; 96  (+41)
+     *   leak fault, run 2     slope +560.29/h  ceiling 70 -&gt; 103 (+33)
+     * </pre>
+     *
+     * So the slope threshold is 25/h — roughly eighteen standard errors above the noise and
+     * sixteen times below the smallest fault — and the ceiling threshold is 16, five times above
+     * the largest clean rise and twice below the smallest fault. Both are asserted, because each
+     * covers the other's blind spot.
+     *
+     * <p>Neither is the primary defence. That is the unconditional check that all three handle
+     * counts are zero once the pools have closed, which has no threshold to get wrong and is the
+     * same assertion {@code NativeTestBase} makes after every test. The two window statistics
+     * exist to catch a leak that something happens to clean up before the end.
      */
     private static void judgeMemory(List<String> failures, Fit rss, Fit footprint, Fit handles) {
         if (rss.points >= 4 && rss.ceilingRise() / 1048576.0 > maxCeilingRiseMb) {
@@ -1130,6 +1158,19 @@ public final class SoakProbe {
                             + " threshold (%.1f MB -> %.1f MB)",
                     footprint.ceilingRise() / 1048576.0, maxCeilingRiseMb,
                     footprint.ceilingFirstHalf / 1048576.0, footprint.ceilingSecondHalf / 1048576.0));
+        }
+        // Handles get both statistics, because each covers the other's blind spot: the ceiling
+        // is deaf to a slow steady climb that never exceeds the pool's own high-water mark, and
+        // the slope is noisy on a counter that swings by ten. A clean run passes both by a wide
+        // margin and an injected leak fails both by a wider one, so requiring both costs nothing
+        // and removes the need to pick.
+        if (handles.points >= 4 && handles.ceilingRise() > maxHandleCeilingRise) {
+            failures.add(String.format(
+                    Locale.ROOT,
+                    "the native handle ceiling rose %.0f across the window, above the %.0f"
+                            + " threshold (%.0f -> %.0f)",
+                    handles.ceilingRise(), maxHandleCeilingRise,
+                    handles.ceilingFirstHalf, handles.ceilingSecondHalf));
         }
         if (handles.slopePerHour > maxHandleSlopePerHour) {
             failures.add(String.format(
@@ -1316,8 +1357,9 @@ public final class SoakProbe {
         Fit handles = fit(series(3));
         StringBuilder text = new StringBuilder();
         text.append("re-analysing ").append(csv).append(", ").append(samples.size())
-                .append(" samples, ceiling threshold ").append(maxCeilingRiseMb)
-                .append(" MB, handle slope threshold ").append(maxHandleSlopePerHour)
+                .append(" samples\nthresholds: memory ceiling ").append(maxCeilingRiseMb)
+                .append(" MB, handle ceiling ").append(maxHandleCeilingRise)
+                .append(", handle slope ").append(maxHandleSlopePerHour)
                 .append("/h\n\n=== slope and ceiling over the last 80% of the window ===\n");
         text.append(describeFit("rss MB", rss, 1048576.0, "MB")).append('\n');
         text.append(describeFit("phys_footprint MB", footprint, 1048576.0, "MB")).append('\n');
@@ -1359,7 +1401,8 @@ public final class SoakProbe {
         url = options.getOrDefault("--url", "jdbc:chdb::memory:");
         out = Paths.get(options.getOrDefault("--out", "target/soak"));
         maxCeilingRiseMb = Double.parseDouble(options.getOrDefault("--max-ceiling-rise", "32"));
-        maxHandleSlopePerHour = Double.parseDouble(options.getOrDefault("--max-handle-slope", "0.5"));
+        maxHandleSlopePerHour = Double.parseDouble(options.getOrDefault("--max-handle-slope", "25"));
+        maxHandleCeilingRise = Double.parseDouble(options.getOrDefault("--max-handle-ceiling-rise", "16"));
 
         if (options.containsKey("--analyze")) {
             System.exit(analyze(Paths.get(options.get("--analyze"))));
@@ -1466,10 +1509,14 @@ if [ -z "$ANALYZE" ]; then
 fi
 [ -x "$JAVA_BIN" ] || command -v "$JAVA_BIN" >/dev/null 2>&1 || die "no java at ${JAVA_BIN}"
 
-if [ -z "$OUT" ]; then
-  OUT="${ROOT}/target/soak/$(date -u +%Y%m%dT%H%M%SZ)-${FAULT}"
+# Not in --analyze mode, which writes nothing: creating the directory there would litter
+# target/soak with empty timestamped runs every time somebody re-read an old one.
+if [ -z "$ANALYZE" ]; then
+  if [ -z "$OUT" ]; then
+    OUT="${ROOT}/target/soak/$(date -u +%Y%m%dT%H%M%SZ)-${FAULT}"
+  fi
+  mkdir -p "$OUT"
 fi
-mkdir -p "$OUT"
 
 # The classpath is built from the reactor, not from ~/.m2, and then cut down to the three jars
 # the probe actually needs. Both halves matter. Resolving through the reactor is what makes
@@ -1518,7 +1565,8 @@ if [ -n "$ANALYZE" ]; then
   exec "$JAVA_BIN" -cp "${CP}:${PROBE}" SoakProbe \
     --analyze "$ANALYZE" \
     --max-ceiling-rise "$MAX_CEILING_RISE" \
-    --max-handle-slope "$MAX_HANDLE_SLOPE"
+    --max-handle-slope "$MAX_HANDLE_SLOPE" \
+    --max-handle-ceiling-rise "$MAX_HANDLE_CEILING_RISE"
 fi
 
 # --------------------------------------------------------------------------------- run
@@ -1547,6 +1595,7 @@ set +e
   --out "$OUT" \
   --max-ceiling-rise "$MAX_CEILING_RISE" \
   --max-handle-slope "$MAX_HANDLE_SLOPE" \
+  --max-handle-ceiling-rise "$MAX_HANDLE_CEILING_RISE" \
   2>&1 | tee "${OUT}/soak.log"
 STATUS=${PIPESTATUS[0]}
 set -e
