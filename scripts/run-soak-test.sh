@@ -714,9 +714,11 @@ public final class SoakProbe {
         long iteration = 0;
         while (running && System.currentTimeMillis() < deadline) {
             if (quiet) {
-                // The pool-drain arm is idle on purpose. Sleeping here rather than skipping the
-                // iteration keeps the progress counter still, which is correct: the watchdog
-                // only ever runs against the steady arm.
+                // The pool-drain arm is idle on purpose, so the progress counter stops here.
+                // That is safe rather than lucky: the quiet period is five seconds against a
+                // stall window of 180, so the watchdog -- which runs in both arms -- cannot
+                // mistake a deliberate lull for a hang. If either number is ever changed, that
+                // is the relationship to keep.
                 try {
                     Thread.sleep(200);
                 } catch (InterruptedException e) {
