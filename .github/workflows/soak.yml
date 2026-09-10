@@ -23,10 +23,18 @@ name: soak
 # The fault modes are in the matrix on purpose, and they matter as much as the clean run. A
 # soak that has never been shown to go red proves only that the process did not crash. So a
 # scheduled run does the clean window *and* the three faults, each of which must fail, and in
-# the right way: leak-resultset caught by the handle slope, stall-worker by the progress
-# watchdog, deadlock by ThreadMXBean.findDeadlockedThreads. That is why the fault jobs are
-# `continue-on-error` with an explicit exit-code check rather than `if: failure()` -- a compile
-# error is also a failure, and would otherwise read as the harness working.
+# the right way: leak-resultset caught by something a leak actually moves, stall-worker by the
+# progress watchdog, deadlock by ThreadMXBean.findDeadlockedThreads. That is why the fault jobs
+# are `continue-on-error` with an explicit exit-code check rather than `if: failure()` -- a
+# compile error is also a failure, and would otherwise read as the harness working.
+#
+# Two arms, and the difference is which bug the run is capable of finding. `steady` holds one
+# connection open for the whole window, so the embedded engine boots once and what the run
+# measures is this driver. `pool-drain` lets the pool empty during quiet periods, which restarts
+# the engine -- an ordinary consequence of `minimumIdle=0` and a shape real users hit, but also
+# one chdb-core avoids in its own suite because repeated restarts under accumulated state can
+# corrupt the process allocator on macOS. The gate is the steady arm; pool-drain is a separate
+# job at the bottom of this file that asserts nothing, for the reason given there.
 #
 # Linux x86_64 by default because it is the cheapest runner with enough cores to make the
 # concurrency real. Nothing in the harness is platform-specific except how it reads the
@@ -57,6 +65,12 @@ on:
         default: none
         type: choice
         options: [none, leak-resultset, stall-worker, deadlock]
+      arm:
+        description: "steady pins a connection so the engine boots once; pool-drain lets it restart"
+        required: false
+        default: steady
+        type: choice
+        options: [steady, pool-drain]
   schedule:
     - cron: "0 3 * * 0"
 
@@ -139,6 +153,7 @@ jobs:
             --minutes "$MINUTES" \
             --threads "${{ inputs.threads || '8' }}" \
             --fault "${{ matrix.fault }}" \
+            --arm "${{ inputs.arm || 'steady' }}" \
             --out "$PWD/target/soak-out"
 
       - name: Judge the exit code
@@ -181,7 +196,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: soak-${{ matrix.fault }}-${{ steps.platform.outputs.id }}
+          name: soak-${{ matrix.fault }}-${{ inputs.arm || 'steady' }}-${{ steps.platform.outputs.id }}
           path: |
             target/soak-out/samples.csv
             target/soak-out/verdict.txt
@@ -189,5 +204,85 @@ jobs:
             target/soak-out/soak.log
             target/soak-out/stall-report.txt
             target/soak-out/stall-native-sample.txt
+          if-no-files-found: warn
+          retention-days: 90
+
+  # The pool-drain shape, on the weekly run only, and deliberately **not** a gate.
+  #
+  # It lets the pool empty during a quiet period, which tears the embedded engine down and boots
+  # it again on the next request. That is an ordinary consequence of `minimumIdle=0`, which is an
+  # ordinary setting for a low-traffic service, so the shape is worth exercising. It is also the
+  # shape chdb-core avoids in its own suite, because repeated engine restarts under accumulated
+  # state can corrupt the process allocator on macOS -- at a rate they measured around 1 run in
+  # 10.
+  #
+  # Which is exactly why this job asserts nothing. Requiring it to pass would make the weekly run
+  # flake on a known upstream hazard; requiring it to fail would be worse, since it passes most
+  # of the time. It runs, it archives what happened, and a human reads it. A single failure is
+  # the already-documented hazard; failing consistently is news.
+  pool-drain:
+    name: soak pool-drain (not a gate)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Cache the pinned engine download
+        uses: actions/cache@v4
+        with:
+          path: target/engine/download
+          key: chdb-engine-linux-x86_64-gnu-${{ hashFiles('scripts/engine.properties') }}
+
+      - name: Compile the Java side
+        run: mvn $MAVEN_ARGS -pl chdb-jdbc -am compile
+
+      - name: Fetch the engine and build the shim
+        run: scripts/build-native-in-container.sh linux-x86_64-gnu
+
+      - name: Soak with the pool draining to zero
+        continue-on-error: true
+        run: |
+          set -u
+          scripts/run-soak-test.sh \
+            --minutes 30 \
+            --threads 8 \
+            --arm pool-drain \
+            --out "$PWD/target/soak-drain"
+
+      - name: Report what happened, without judging it
+        run: |
+          set -eu
+          if [ ! -f target/soak-drain/run.properties ]; then
+            echo "::warning::the pool-drain arm never started"
+            exit 0
+          fi
+          STATUS="$(sed -n 's/^exit=//p' target/soak-drain/run.properties)"
+          RESTARTS="$(grep -o 'engine restarts observed (0 -> 1 transitions) *[0-9]*' \
+                        target/soak-drain/verdict.txt 2>/dev/null | grep -o '[0-9]*$' || true)"
+          echo "pool-drain exit=$STATUS engine restarts=${RESTARTS:-unknown}"
+          if [ "${RESTARTS:-0}" = "0" ]; then
+            echo "::warning::the pool never drained, so this arm exercised nothing -- check the timings"
+          fi
+          if [ "$STATUS" -gt 128 ] 2>/dev/null; then
+            echo "::warning::the pool-drain arm died of signal $((STATUS - 128)) after ${RESTARTS:-?} engine restarts. That is the documented upstream hazard, not a driver regression -- see docs/release-readiness.md section 3.1.1"
+          fi
+
+      - name: Upload the pool-drain evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-pool-drain-linux-x86_64-gnu
+          path: |
+            target/soak-drain/samples.csv
+            target/soak-drain/verdict.txt
+            target/soak-drain/run.properties
+            target/soak-drain/soak.log
           if-no-files-found: warn
           retention-days: 90
