@@ -74,6 +74,7 @@
 # Usage:
 #   scripts/run-soak-test.sh [--minutes N] [--threads N] [--sample-seconds N]
 #                            [--stall-seconds N] [--fault none|leak-resultset|stall-worker|deadlock]
+#                            [--arm steady|pool-drain]
 #                            [--url JDBC-URL] [--out DIR] [--runtime DIR] [--jvm PATH]
 #                            [--max-ceiling-rise MB] [--max-handle-slope N/h]
 #                            [--max-handle-ceiling-rise N]
@@ -96,6 +97,7 @@ THREADS=8
 SAMPLE_SECONDS=15
 STALL_SECONDS=180
 FAULT=none
+ARM=steady
 URL="jdbc:chdb::memory:"
 OUT=""
 RUNTIME=""
@@ -113,6 +115,7 @@ while [ $# -gt 0 ]; do
     --sample-seconds) SAMPLE_SECONDS="$2"; shift 2 ;;
     --stall-seconds) STALL_SECONDS="$2"; shift 2 ;;
     --fault) FAULT="$2"; shift 2 ;;
+    --arm) ARM="$2"; shift 2 ;;
     --url) URL="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --runtime) RUNTIME="$2"; shift 2 ;;
@@ -130,6 +133,11 @@ done
 case "$FAULT" in
   none|leak-resultset|stall-worker|deadlock) ;;
   *) die "unknown --fault $FAULT" ;;
+esac
+
+case "$ARM" in
+  steady|pool-drain) ;;
+  *) die "unknown --arm $ARM (steady or pool-drain)" ;;
 esac
 
 case "$(uname -s)-$(uname -m)" in
@@ -217,6 +225,7 @@ public final class SoakProbe {
     /** Take phys_footprint every other sample: it costs about a second, RSS costs nothing. */
     private static int footprintEvery = 2;
     private static String fault = "none";
+    private static String arm = "steady";
     private static String url = "jdbc:chdb::memory:";
     private static Path out;
     private static double maxCeilingRiseMb;
@@ -247,6 +256,46 @@ public final class SoakProbe {
     private static final AtomicLong iterations = new AtomicLong();
     private static final AtomicLong rowsRead = new AtomicLong();
     private static final AtomicLong unexpected = new AtomicLong();
+
+    /**
+     * How often this process had no chDB connection open at all, and so no engine.
+     *
+     * <p>Not curiosity, and the reason the {@code steady} arm pins a connection. chdb-core's own
+     * test runner records that "starting and tearing the embedded engine down on every
+     * connection repeatedly can corrupt the process allocator and abort under load on macOS",
+     * and works around it by splitting its suite across processes "so that no single process
+     * accumulates the whole suite's engine create/destroy churn". The engine is booted by the
+     * connection that finds none open and torn down by the last one to close — the driver's own
+     * documentation says the {@code :memory:} database "lives until the last of them closes" —
+     * so a soak that repeatedly drains to zero connections is sitting squarely in that
+     * known-dangerous shape, and a crash it produced would be that known upstream issue rather
+     * than a finding about this driver.
+     *
+     * <p>Measured, not assumed. The 15-second sampler cannot answer it: a gap between iterations
+     * is milliseconds wide. So a dedicated thread polls the live connection-handle count every
+     * 5 ms, counts the times it saw zero, and counts the transitions from zero back up — which
+     * is the number of times the engine booted. In the {@code steady} arm both must be zero
+     * after the pin is taken, and the verdict fails if they are not: "we were measuring our own
+     * driver" is a claim that needs evidence, not a configuration comment.
+     */
+    private static final AtomicLong zeroConnectionObservations = new AtomicLong();
+    private static final AtomicLong engineFloorSamples = new AtomicLong();
+    private static final AtomicLong engineBoots = new AtomicLong();
+    private static volatile long minConnectionHandles = Long.MAX_VALUE;
+
+    /** The connection held open for the whole window in the {@code steady} arm. */
+    private static Connection pinnedConnection;
+
+    /**
+     * Set while the {@code pool-drain} arm is deliberately idle, so the pool can empty.
+     *
+     * <p>Without it the arm would not drain anything: eight workers under continuous load keep
+     * the pool busy, and HikariCP only evicts what has been idle. A low-traffic service — the
+     * kind that gets configured with {@code minimumIdle=0} in the first place — has quiet
+     * windows by definition, so the arm reproduces them: ten seconds of load, five seconds of
+     * quiet, repeatedly, against a one-second idle timeout.
+     */
+    private static volatile boolean quiet;
 
     /** Per shape and per outcome, so the report can say what actually ran rather than what was asked for. */
     private static final Map<String, AtomicLong> outcomes =
@@ -664,6 +713,18 @@ public final class SoakProbe {
         Random random = new Random(ThreadLocalRandom.current().nextLong() ^ index);
         long iteration = 0;
         while (running && System.currentTimeMillis() < deadline) {
+            if (quiet) {
+                // The pool-drain arm is idle on purpose. Sleeping here rather than skipping the
+                // iteration keeps the progress counter still, which is correct: the watchdog
+                // only ever runs against the steady arm.
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                continue;
+            }
             iteration++;
             String shape = pickShape(random);
             try {
@@ -875,6 +936,55 @@ public final class SoakProbe {
             System.out.println("sampler failed: " + e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Watches for the moment this process has no engine, at 5 ms resolution.
+     *
+     * <p>See {@link #zeroConnectionObservations} for why this is worth a thread.
+     */
+    private static void engineFloorWatcher(long deadline) {
+        boolean wasZero = false;
+        while (running && System.currentTimeMillis() < deadline) {
+            long open = ChdbNative.openHandleCount(ChdbNative.KIND_CONNECTION);
+            engineFloorSamples.incrementAndGet();
+            if (open == 0) {
+                zeroConnectionObservations.incrementAndGet();
+                wasZero = true;
+            } else if (wasZero) {
+                // Zero, then not zero: a connection found no engine and booted one.
+                engineBoots.incrementAndGet();
+                wasZero = false;
+            }
+            if (open < minConnectionHandles) {
+                minConnectionHandles = open;
+            }
+            try {
+                Thread.sleep(5);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    /** Cycles the {@code pool-drain} arm between load and quiet so the pool can empty. */
+    private static void quietCycler(long deadline) {
+        try {
+            while (running && System.currentTimeMillis() < deadline) {
+                quiet = false;
+                Thread.sleep(10000);
+                if (!running) {
+                    return;
+                }
+                quiet = true;
+                Thread.sleep(5000);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            quiet = false;
         }
     }
 
@@ -1142,7 +1252,67 @@ public final class SoakProbe {
      * same assertion {@code NativeTestBase} makes after every test. The two window statistics
      * exist to catch a leak that something happens to clean up before the end.
      */
+    /**
+     * The shortest fit window the memory ceiling is asserted on, in seconds.
+     *
+     * <p>The ceiling is only a meaningful statistic once each half of the window has seen enough
+     * of the oscillation to have found its top. Measured ceiling rises on clean runs, by window
+     * length:
+     *
+     * <pre>
+     *    3 minutes    +37.88 MB   -- three footprint samples per half; meaningless
+     *   10 minutes    -34.20 MB
+     *   66 minutes     -2.39 MB
+     *   75 minutes     +3.91 MB
+     * </pre>
+     *
+     * So a three-minute run fails a 32 MB threshold on phase alone, and the two long windows
+     * agree within 4 MB. Thirty minutes of fit window is the guard: comfortably past the point
+     * where the statistic settles, and far below the 1-6 hours the gate asks for, so it never
+     * fires on a gate run. Below it the ceilings are printed and not asserted, which is the
+     * honest thing — a criterion that cannot mean anything yet should say so rather than
+     * produce a verdict.
+     */
+    private static final long MIN_MEMORY_FIT_SECONDS = 1800;
+
+    /** Why the memory ceiling was not asserted, or null when it was. */
+    private static String memoryNotJudged;
+
+    /** Seconds spanned by the fit window, or 0 when there is not one. */
+    private static long fitWindowSeconds() {
+        synchronized (samples) {
+            if (samples.size() < 2) {
+                return 0;
+            }
+            int from = (int) Math.floor(samples.size() * 0.2);
+            return samples.get(samples.size() - 1).elapsedSeconds - samples.get(from).elapsedSeconds;
+        }
+    }
+
     private static void judgeMemory(List<String> failures, Fit rss, Fit footprint, Fit handles) {
+        // Handles are judged at any window length: the counter is not a cache and does not need
+        // a long window to have found its top.
+        if (handles.points >= 4 && handles.ceilingRise() > maxHandleCeilingRise) {
+            failures.add(String.format(
+                    Locale.ROOT,
+                    "the native handle ceiling rose %.0f across the window, above the %.0f"
+                            + " threshold (%.0f -> %.0f)",
+                    handles.ceilingRise(), maxHandleCeilingRise,
+                    handles.ceilingFirstHalf, handles.ceilingSecondHalf));
+        }
+        if (handles.slopePerHour > maxHandleSlopePerHour) {
+            failures.add(String.format(
+                    Locale.ROOT, "native handle slope %.2f/h is above the %.2f/h threshold",
+                    handles.slopePerHour, maxHandleSlopePerHour));
+        }
+
+        long span = fitWindowSeconds();
+        if (span < MIN_MEMORY_FIT_SECONDS) {
+            memoryNotJudged = "the fit window spans " + span + "s, under the "
+                    + MIN_MEMORY_FIT_SECONDS + "s the memory ceiling needs to mean anything, so"
+                    + " the RSS and phys_footprint ceilings above were printed and not asserted";
+            return;
+        }
         if (rss.points >= 4 && rss.ceilingRise() / 1048576.0 > maxCeilingRiseMb) {
             failures.add(String.format(
                     Locale.ROOT,
@@ -1158,24 +1328,6 @@ public final class SoakProbe {
                             + " threshold (%.1f MB -> %.1f MB)",
                     footprint.ceilingRise() / 1048576.0, maxCeilingRiseMb,
                     footprint.ceilingFirstHalf / 1048576.0, footprint.ceilingSecondHalf / 1048576.0));
-        }
-        // Handles get both statistics, because each covers the other's blind spot: the ceiling
-        // is deaf to a slow steady climb that never exceeds the pool's own high-water mark, and
-        // the slope is noisy on a counter that swings by ten. A clean run passes both by a wide
-        // margin and an injected leak fails both by a wider one, so requiring both costs nothing
-        // and removes the need to pick.
-        if (handles.points >= 4 && handles.ceilingRise() > maxHandleCeilingRise) {
-            failures.add(String.format(
-                    Locale.ROOT,
-                    "the native handle ceiling rose %.0f across the window, above the %.0f"
-                            + " threshold (%.0f -> %.0f)",
-                    handles.ceilingRise(), maxHandleCeilingRise,
-                    handles.ceilingFirstHalf, handles.ceilingSecondHalf));
-        }
-        if (handles.slopePerHour > maxHandleSlopePerHour) {
-            failures.add(String.format(
-                    Locale.ROOT, "native handle slope %.2f/h is above the %.2f/h threshold",
-                    handles.slopePerHour, maxHandleSlopePerHour));
         }
     }
 
@@ -1225,6 +1377,18 @@ public final class SoakProbe {
         text.append(String.format(
                 Locale.ROOT, "  %-52s %10s%n", "handles after the pools closed",
                 finalConnection + "/" + finalResult + "/" + finalStream));
+        text.append(String.format(
+                Locale.ROOT, "  %-52s %10d%n", "engine-floor samples (every 5 ms)",
+                engineFloorSamples.get()));
+        text.append(String.format(
+                Locale.ROOT, "  %-52s %10d%n", "of those, zero connections open (engine down)",
+                zeroConnectionObservations.get()));
+        text.append(String.format(
+                Locale.ROOT, "  %-52s %10d%n", "engine restarts observed (0 -> 1 transitions)",
+                engineBoots.get()));
+        text.append(String.format(
+                Locale.ROOT, "  %-52s %10d%n", "lowest connection count seen",
+                minConnectionHandles == Long.MAX_VALUE ? -1 : minConnectionHandles));
 
         if (!firstErrors.isEmpty()) {
             text.append("\n=== first unexpected failures ===\n");
@@ -1233,6 +1397,19 @@ public final class SoakProbe {
                     text.append("  ").append(error).append('\n');
                 }
             }
+        }
+
+        // The steady arm's whole premise is that the engine booted once, so that what the run
+        // measured was this driver rather than the engine-restart hazard chdb-core documents.
+        // Asserted rather than assumed: a pool setting that quietly stopped working would
+        // otherwise turn a clean result into a claim about the wrong thing.
+        if ("steady".equals(arm) && engineFloorSamples.get() > 0
+                && zeroConnectionObservations.get() > 0) {
+            failures.add(
+                    "the connection count reached zero " + zeroConnectionObservations.get()
+                            + " times and the engine restarted " + engineBoots.get()
+                            + " times, so this run was not the steady arm it claims to be -- see"
+                            + " the pin in main()");
         }
 
         // A run that measured nothing must not report success -- the same discipline
@@ -1289,8 +1466,13 @@ public final class SoakProbe {
         judgeMemory(failures, rss, footprint, handles);
 
         text.append('\n');
+        if (memoryNotJudged != null) {
+            text.append("NOT JUDGED: ").append(memoryNotJudged).append('\n');
+        }
         if (failures.isEmpty()) {
-            text.append("VERDICT=clean\n");
+            text.append(memoryNotJudged == null
+                    ? "VERDICT=clean\n"
+                    : "VERDICT=clean (handles and workload; memory ceiling not asserted)\n");
         } else {
             text.append("VERDICT=failed\n");
             for (String failure : failures) {
@@ -1398,6 +1580,7 @@ public final class SoakProbe {
         sampleMillis = TimeUnit.SECONDS.toMillis(Long.parseLong(options.getOrDefault("--sample-seconds", "15")));
         stallMillis = TimeUnit.SECONDS.toMillis(Long.parseLong(options.getOrDefault("--stall-seconds", "180")));
         fault = options.getOrDefault("--fault", "none");
+        arm = options.getOrDefault("--arm", "steady");
         url = options.getOrDefault("--url", "jdbc:chdb::memory:");
         out = Paths.get(options.getOrDefault("--out", "target/soak"));
         maxCeilingRiseMb = Double.parseDouble(options.getOrDefault("--max-ceiling-rise", "32"));
@@ -1434,14 +1617,43 @@ public final class SoakProbe {
             System.exit(5);
         }
 
+        // The pin. Taken before the pool exists and released after every worker has stopped, so
+        // that for the whole window at least one connection is open and the engine is booted
+        // exactly once. Outside the pool on purpose: making this depend on HikariCP's idle and
+        // max-lifetime bookkeeping would make the premise of the whole run depend on getting
+        // three pool settings right, and HikariCP's own default maxLifetime is 30 minutes, which
+        // an hour-long window crosses. A connection this process holds itself cannot be retired
+        // by anything.
+        if ("steady".equals(arm)) {
+            pinnedConnection = DriverManager.getConnection(url);
+            try (Statement statement = pinnedConnection.createStatement();
+                    ResultSet rs = statement.executeQuery("SELECT 1")) {
+                rs.next();
+            }
+            System.out.println("soak: pinned one connection for the window; the engine boots once");
+        } else {
+            System.out.println("soak: NO pinned connection -- this arm lets the pool drain to zero"
+                    + " and the engine restart, which is the known-hazardous shape");
+        }
+
         HikariConfig config = new HikariConfig();
         config.setJdbcUrl(url);
         config.setMaximumPoolSize(threads);
-        // Zero idle with a short idle timeout so the pool really does drop to nothing and
-        // re-open, which is what churns StoragePathRegistry's refcount rather than pinning it.
-        config.setMinimumIdle(0);
-        config.setIdleTimeout(TimeUnit.SECONDS.toMillis(20));
-        config.setMaxLifetime(TimeUnit.MINUTES.toMillis(2));
+        if ("steady".equals(arm)) {
+            // One connection always retained, plus the pin. Lifetime churn is kept, because
+            // retiring and replacing a pooled connection is coverage worth having -- it just
+            // must not be able to take the last connection in the process with it.
+            config.setMinimumIdle(1);
+            config.setIdleTimeout(TimeUnit.SECONDS.toMillis(30));
+            config.setMaxLifetime(TimeUnit.MINUTES.toMillis(2));
+        } else {
+            // Deliberately the configuration that drains: minimumIdle=0 with a short idle
+            // timeout. This is not an exotic setting -- it is what a low-traffic service is
+            // routinely configured with, which is exactly why the arm exists.
+            config.setMinimumIdle(0);
+            config.setIdleTimeout(TimeUnit.SECONDS.toMillis(1));
+            config.setMaxLifetime(TimeUnit.SECONDS.toMillis(30));
+        }
         config.setConnectionTimeout(TimeUnit.SECONDS.toMillis(30));
         config.setPoolName("chdb-soak");
         pool = new HikariDataSource(config);
@@ -1465,12 +1677,20 @@ public final class SoakProbe {
         sampler.setDaemon(true);
         Thread watchdog = new Thread(() -> watchdog(deadline), "soak-watchdog");
         watchdog.setDaemon(true);
+        Thread engineFloor = new Thread(() -> engineFloorWatcher(deadline), "soak-engine-floor");
+        engineFloor.setDaemon(true);
 
         for (Thread thread : workers) {
             thread.start();
         }
         sampler.start();
         watchdog.start();
+        engineFloor.start();
+        if ("pool-drain".equals(arm)) {
+            Thread cycler = new Thread(() -> quietCycler(deadline), "soak-quiet-cycler");
+            cycler.setDaemon(true);
+            cycler.start();
+        }
 
         // A stalled worker never returns, so this cannot be a plain join: it polls, and stops
         // waiting the moment the watchdog has reported. Without that, a fault run would sit out
@@ -1490,7 +1710,13 @@ public final class SoakProbe {
             // count. After a stall the process is being abandoned anyway.
             cancellers.shutdownNow();
             pool.close();
-            System.out.println("soak: pool closed, " + leaked.size() + " objects deliberately leaked");
+            // The pin goes last, so the engine is torn down once, at the end, by us -- and so
+            // the handle count can legitimately reach zero for the final assertion.
+            if (pinnedConnection != null) {
+                pinnedConnection.close();
+            }
+            System.out.println("soak: pool closed, pin released, " + leaked.size()
+                    + " objects deliberately leaked");
         }
 
         System.exit(verdict());
@@ -1513,7 +1739,7 @@ fi
 # target/soak with empty timestamped runs every time somebody re-read an old one.
 if [ -z "$ANALYZE" ]; then
   if [ -z "$OUT" ]; then
-    OUT="${ROOT}/target/soak/$(date -u +%Y%m%dT%H%M%SZ)-${FAULT}"
+    OUT="${ROOT}/target/soak/$(date -u +%Y%m%dT%H%M%SZ)-${ARM}-${FAULT}"
   fi
   mkdir -p "$OUT"
 fi
@@ -1591,6 +1817,7 @@ set +e
   --sample-seconds "$SAMPLE_SECONDS" \
   --stall-seconds "$STALL_SECONDS" \
   --fault "$FAULT" \
+  --arm "$ARM" \
   --url "$URL" \
   --out "$OUT" \
   --max-ceiling-rise "$MAX_CEILING_RISE" \
