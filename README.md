@@ -242,9 +242,23 @@ a real JVM against the real engine, and ASan plus UBSan over a 199-check harness
 own logic. ASan cannot cover the full suite — the released engine is not ASan-clean — which is
 [written up with the evidence](docs/upstream-findings.md).
 
-**Not yet tested:** OpenJ9, a multi-hour soak, cgroup memory limits, `noexec` temporary
-directories, and the JDBC frameworks. The macOS floors are pinned and checked at build time
-but not exercised on an old macOS, because no such runner exists.
+**A concurrent soak**, because none of the above runs long enough to find a leak or a deadlock
+that only appears under sustained load: `scripts/run-soak-test.sh` puts eight threads on a pool
+with a connection per query, mixing streamed and materialized reads, cancels, query timeouts,
+early `ResultSet.close()`, cascading `Connection.close()` and parameterised statements, and
+tracks RSS, `phys_footprint` and the native handle counters across the window. Measured over 75
+minutes: 482,442 iterations, RSS and `phys_footprint` ceilings flat within 12 MB, handles back
+to zero, no deadlock, no unexpected failure. All three of its detectors were driven by an
+injected fault first, because a soak that has never gone red proves only that nothing crashed.
+It also, on a separate attempt, killed the JVM with no crash report of any kind — an
+[engine-level hazard](docs/upstream-findings.md), not a driver defect, and the reason
+**a connection pool must keep `minimumIdle` at 1 or more**
+([why](docs/unsupported.md#constraints-not-refusals)).
+[release-readiness §3.1.1](docs/release-readiness.md) has both halves.
+
+**Not yet tested:** OpenJ9, cgroup memory limits, `noexec` temporary directories, and the JDBC
+frameworks. The macOS floors are pinned and checked at build time but not exercised on an old
+macOS, because no such runner exists.
 
 ## Documentation
 

@@ -215,7 +215,7 @@ are in place, but the three-way benchmark the plan asks for in §3.3 has not bee
 | Phase | | Notes |
 |---|---|---|
 | 9 — JDBC ecosystem | 🟡 | `META-INF/services/java.sql.Driver` ✅, `DriverPropertyInfo` ✅, minimum `DatabaseMetaData` ✅, `Automatic-Module-Name` ✅, ClassLoader diagnostics ✅ and documented for Tomcat/Spark/Flink. HikariCP, MyBatis and jOOQ smoke tests ✅, and every `DatabaseMetaData` method swept reflectively with nothing throwing ✅ (179 on JDK 11 through 26). ⬜ Spring `JdbcTemplate`; 🚫 ShardingSphere, which cannot parse a `jdbc:chdb:` URL at all; ⬜ JPMS module-path and two-child-ClassLoader tests |
-| 10 — Off-heap memory and stability | 🟡 | Handle counters asserted zero after every test ✅; bounded streaming, slow consumer, early close, cancel and 1000-query RSS plateau ✅. UBSan over the whole JDBC suite ✅ and ASan+UBSan over the shim's own logic ✅, on both a Linux and a macOS toolchain — but **ASan cannot run against the released engine at all** ([findings §8](upstream-findings.md)), so full-process ASan and LSan need an upstream sanitizer build. ⬜ 1-6 hour soak; ⬜ cgroup + `max_memory_usage` matrix; ⬜ `Cleaner` backstop |
+| 10 — Off-heap memory and stability | 🟡 | Handle counters asserted zero after every test ✅; bounded streaming, slow consumer, early close, cancel and 1000-query RSS plateau ✅. UBSan over the whole JDBC suite ✅ and ASan+UBSan over the shim's own logic ✅, on both a Linux and a macOS toolchain — but **ASan cannot run against the released engine at all** ([findings §8](upstream-findings.md)), so full-process ASan and LSan need an upstream sanitizer build. ✅ Concurrent soak — `scripts/run-soak-test.sh`, 75 minutes on 8 threads, clean on memory, handles and deadlocks, with all three of its detectors driven by an injected fault first ([release-readiness §3.1.1](release-readiness.md)); it also reproduced issue #14 on an ordinary workload. ⬜ cgroup + `max_memory_usage` matrix; ⬜ `Cleaner` backstop |
 | 11 — Platform and JDK matrix | 🟡 | ✅ All four platforms × Java 11/17/21/25 run the full suite in CI, plus Java 26 as allow-failure and a packaged-JAR load on each. ⬜ OpenJ9; ⬜ awkward paths; ⬜ corrupted-library and arch-mismatch cases |
 | 12 — ADBC experiment | ⬜ | Untouched. Does not block V1 |
 | 13 — Documentation | 🟡 | README, type mapping, unsupported JDBC, native loading, signal handlers, memory, ClassLoaders and upstream findings ✅, plus a runnable example. ⬜ Per-platform dependency snippets await published coordinates; ⬜ crash-report template |
@@ -234,8 +234,8 @@ are in place, but the three-way benchmark the plan asks for in §3.3 has not bee
 | ASan, LSan, UBSan clean | 🟡 UBSan clean over the whole suite and ASan clean over the shim harness, on Linux and macOS; full-process ASan and LSan blocked on an upstream sanitizer build of chdb-core |
 | Native handle count zero after every test | ✅ 221 tests |
 | Large results stream in bounded memory | ✅ 20M rows, +17 MB RSS |
-| 1000 queries and a soak show no linear RSS growth | 🟡 1000 queries ✅, soak ⬜ |
-| Cancel, timeout, early close and cascading close leak-free and deadlock-free | ✅ |
+| 1000 queries and a soak show no linear RSS growth | ✅ 1000 queries, and a 75-minute concurrent soak — 482,442 iterations on 8 threads, RSS and `phys_footprint` ceilings flat within 12 MB, handles back to 0 ([release-readiness §3.1.1](release-readiness.md)) |
+| Cancel, timeout, early close and cascading close leak-free and deadlock-free | ✅ and now under sustained concurrency rather than only in a test method: 23,966 cancels, 19,299 timeouts, 67,813 early closes and 67,194 unpooled cascading closes over 75 minutes on 8 threads, with no deadlock and handles back to zero |
 | PreparedStatement does not interpolate | ✅ |
 | UTF-8, NUL, quotes, comments and hostile parameters pass | ✅ |
 | Unsupported JDBC throws `SQLFeatureNotSupportedException` | ✅ |
@@ -257,7 +257,17 @@ are in place, but the three-way benchmark the plan asks for in §3.3 has not bee
    GUI nobody has run. What is left is Spring `JdbcTemplate`. ShardingSphere is not doable until
    upstream stops parsing every JDBC URL as client/server — it is also where issue #2's reporter
    came from.
-3. **The soak test**, the remaining phase-10 item that a CI run cannot stand in for.
+3. **Decide what to do about the two engine-level crash hazards the soak walked into.** An
+   ordinary eight-thread workload with a connection per query killed the JVM inside two minutes,
+   with no `hs_err`, no `.ips` and no core — the signature of issue #14's signal window, though
+   that run also had the pool draining to zero, which restarts the engine and is a *separate*
+   known upstream hazard. Both are engine-level and neither is fixable here. The soak itself is
+   done — `scripts/run-soak-test.sh`, 75 minutes, clean on memory, handles and deadlocks, and it
+   now measures engine restarts so a recurrence can be attributed in one step — so what is left
+   is not a test to write but a release decision, laid out in
+   [release-readiness §3.1.1](release-readiness.md). The user-facing half of it,
+   `minimumIdle >= 1` on any connection pool, is in
+   [unsupported.md](unsupported.md#constraints-not-refusals).
 4. **The §3.3 batch-access benchmark**, so the data-path choice is recorded as measured rather
    than as reasoned.
 5. **Phase 14 release preparation**, which is now the largest untouched block: nothing is

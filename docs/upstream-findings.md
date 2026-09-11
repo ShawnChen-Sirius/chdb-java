@@ -103,6 +103,7 @@ closes 200 connections (`scripts/run-signal-window-test.sh measure`):
 | platform | JVM | observations of a host handler at `SIG_DFL` | samples |
 |---|---|---|---|
 | macOS arm64 | HotSpot 11.0.25 | 648–803 | ~365,000 |
+| macOS arm64 | HotSpot 21.0.12.1 | 614–707 | ~350,000 |
 | linux-aarch64 | Red Hat 11.0.25 | 1,116–1,161 | ~490,000 |
 
 About 0.2% of wall clock, a few microseconds per connect. Small, but it is hit: eight threads
@@ -110,6 +111,42 @@ opening connections alongside eight threads generating stack-guard SIGSEGVs
 (`scripts/run-signal-window-test.sh stress`) killed the JVM in **8 of 8 runs on macOS arm64
 (exit 138, SIGBUS) and 4 of 4 on linux-aarch64 (exit 139, SIGSEGV)**, with no `hs_err` file in
 any of them.
+
+**It may not need the synthetic SIGSEGV generator.** That was the open question left by the
+figures above: 0.2% of wall clock is only lethal if something is reliably producing signals to
+land in it, and `stress` produces them on purpose. The concurrent soak
+(`scripts/run-soak-test.sh`, [release-readiness §3.1.1](release-readiness.md)) produced a
+candidate by accident. Eight threads, a connection per query at about a hundred connects a
+second, an ordinary mixed read/DDL/cancel/timeout workload and **no SIGSEGV generator at all**:
+the JVM died between its 60- and 75-second samples with `Bus error: 10` — exit 138 — and no
+`hs_err` file, no macOS `.ips` crash report and nothing in `/cores`. `run-signal-window-test.sh
+measure` on the same build and engine reported 614–707 host handlers at `SIG_DFL`.
+
+Same signal, same exit code and same absent report as the `stress` runs in the table above.
+`stress` supplies the faults deliberately; ordinary JIT-compiled code on this platform supplies
+them anyway.
+
+**One competing explanation, not excluded.** That run was made before the harness pinned a
+connection, so it was configured to let the pool drain to zero — which restarts the embedded
+engine, and repeated engine restarts under accumulated state are a *separate* known upstream
+hazard that aborts the process on macOS (release-readiness §3.1.1 quotes chdb-core's own
+comment and numbers). The instrumentation that would have said whether the engine actually
+restarted during that run did not exist yet.
+
+What still points here rather than there is the signature. Allocator corruption is documented
+as an **abort** — SIGABRT, host handlers intact, so HotSpot writes `hs_err`. This produced
+SIGBUS and no report at all, and a missing report is this section's defining feature rather than
+an incidental detail. So: most likely this, not provably only this.
+
+Both are now separable in one step. The soak samples the live connection count every 5 ms and
+counts engine restarts, and its steady arm measured 0 restarts over 29,257 samples; a run that
+reports restarts > 0 and dies with SIGABRT and a report is the other hazard, and a run that
+reports 0 restarts and dies with SIGBUS and no report is this one. `run-soak-test.sh` also names
+this signature itself now, rather than leaving an operator with exit 138 and no lead.
+
+Rate, as observed: one crash across the long windows attempted, after about forty-five minutes
+of the same churn had already run clean across five shorter runs of the same harness. Low enough
+that every test in the suite passes, and high enough to matter to anything meant to stay up.
 
 Leaving the opt-out unset is not an escape. With the flag clear, the engine installs its own
 deadly-signal handlers during connect instead, and the same observer sees them in place for

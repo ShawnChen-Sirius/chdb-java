@@ -154,6 +154,24 @@ freeing, so RSS does not return to where it started; what matters is that it rea
 rather than climbing linearly with the number of queries. `StreamingLifecycleIT` uses exactly
 that criterion over a thousand queries.
 
+**RSS is the wrong number to watch on macOS, and the reason is worth knowing** if you are
+measuring a JVM that has the engine loaded. RSS counts pages of the 326 MB engine image as they
+are faulted in, so it rises for a while without anything being allocated, and it does not count
+pages the compressor has taken, so it can *fall* while real usage grows. In the soak run in
+[release-readiness §3.1.1](release-readiness.md) RSS stepped
+down 120 MB while the process was steadily busier. Use `phys_footprint`, which is the kernel's
+own ledger of what is charged to the task:
+
+```bash
+footprint --pid <pid> -f bytes | grep phys_footprint    # macOS
+grep ^Pss /proc/<pid>/smaps_rollup                      # Linux, the same idea
+```
+
+`scripts/run-soak-test.sh` samples both, plus the handle counters below, and judges them on
+whether the *ceiling* rises across the window rather than on a slope — a cache that fills and is
+trimmed makes a slope say whatever the window boundaries want it to say, and it has a ceiling
+where a leak does not. §3.1.1 has the measurement that settled it.
+
 ## Checking for leaks in your own code
 
 The driver counts its open native handles:

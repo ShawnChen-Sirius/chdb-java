@@ -93,9 +93,24 @@ broke is written down. The value of this gate is that list.
 ### 7. Run the concurrent soak
 
 Work plan §5.11: one to six hours of *concurrent* querying. Blocking — see §3.1, which says why
-a single-threaded run does not discharge it.
+a single-threaded run does not discharge it, and §3.1.1 for the harness, the numbers from the
+first long run, and the one thing that run found.
 
-**Done when:** the run is clean and the RSS/PSS slope over its length is written down.
+```bash
+mvn -pl chdb-jdbc -am compile && scripts/build-native.sh <platform>
+scripts/run-soak-test.sh --minutes 75              # or the Actions tab: the `soak` workflow
+```
+
+**Once per release, not once ever.** The mechanisms the soak covers — the execution gate, the
+shim's lock order, the timeout execution number — are exactly the ones a bug fix in the
+concurrent path perturbs, and the whole point of the gate is that a short test does not see
+what an hour of load sees. So a release runs it on the commit being released, not on whichever
+commit last passed it.
+
+**Done when:** the run exits 0 on the release commit, and its numbers are written into §3.1.1
+next to the previous run's. A run that dies with a signal and no `hs_err` has not failed the
+gate so much as hit §3.1.1's open question — the script says so when it happens — and the
+decision recorded there has to be made before the release, not around it.
 
 ### 8. Cut the release
 
@@ -394,8 +409,349 @@ step 6.
 
 | Gate | What it requires | Effort |
 |---|---|---|
-| **Concurrent soak, 1–6 hours** | Work plan §5.11 asks for a *concurrent* soak, not a single-threaded loop: several connections on several threads for the whole window, with the RSS/PSS slope recorded across it. A sequential run measures allocator behaviour and nothing else. The milestone it is there to discharge is that cancel, timeout, early close and cascading `Connection` close "leak nothing and never deadlock" — and a deadlock cannot occur, so cannot be ruled out, in a single thread. Existing coverage is two proxies, each missing one half: the 1000-query RSS plateau is long but sequential, and `HikariPoolIT` is concurrent but minutes rather than hours. | a day, mostly waiting |
+| **Concurrent soak, 1–6 hours** | Work plan §5.11 asks for a *concurrent* soak, not a single-threaded loop: several connections on several threads for the whole window, with the RSS/PSS slope recorded across it. A sequential run measures allocator behaviour and nothing else. The milestone it is there to discharge is that cancel, timeout, early close and cascading `Connection` close "leak nothing and never deadlock" — and a deadlock cannot occur, so cannot be ruled out, in a single thread. `scripts/run-soak-test.sh` now exists and has been run; **§3.1.1 has the numbers, and the reason this row is still marked blocking.** | harness done; an hour per release, and one open question |
 | **External consumption of a published artifact** | The gate says two projects outside this repository. `scripts/verify-consumer.sh` closes the mechanical half locally (§1.5); this is the half that needs other people, and running-order step 6 is where it sits. | depends on others |
+
+### 3.1.1 The soak harness, and what it found
+
+`scripts/run-soak-test.sh`, with the driver at `aa8e0c7`, on macOS 26 / arm64 (18 cores, 36 GB)
+against the pinned v26.7.2-rc.2 engine on Java 21. `.github/workflows/soak.yml` is the same
+thing on demand or weekly, and deliberately **not** on push: an hour-long job per commit would
+make the pipeline useless for what it is for.
+
+**The shape.** `HikariPoolIT`'s, scaled up in time — a pool, eight worker threads, and a
+connection *per query* rather than per thread, because a connection per query is what churns
+the storage-path registry and the per-connection statement slot hardest. A quarter of the
+iterations go to `DriverManager` instead of the pool, which is not variety for its own sake: a
+pooled `Connection.close()` never reaches the driver's cascade, because HikariCP closes the
+tracked `Statement`s itself on the way back to the idle set. The cascade shape has to be
+unpooled to test anything.
+
+**The engine boots once, and that is measured.** This is the premise of the whole run, because
+the alternative measures somebody else's bug. chdb-core's test runner records that "starting and
+tearing the embedded engine down on every connection repeatedly can corrupt the process
+allocator and abort under load on macOS", and is built around avoiding it: a process to itself
+for any test opening a non-`:memory:` path, and the rest split across four processes "so that no
+single process accumulates the whole suite's engine create/destroy churn". Their numbers say it
+takes accumulated state *and* repeated restarts — two state-accumulating suites sharing a
+process crashed 1 run in 10, each alone 0 in 10, and a bare restart loop did not reproduce it in
+30, 40 or 25 attempts.
+
+The engine is booted by the connection that finds none open and torn down by the last one to
+close. `StoragePathRegistry` does not do that — it is bookkeeping over a key and a count, and
+its only action at zero is to let a *different* path bind next. The teardown is the engine's own,
+triggered by `chdb_close_conn` on the last connection, which is why the driver documents the
+`:memory:` database as living "until the last connection closes".
+
+The first version of this harness therefore had it backwards. It set `minimumIdle=0` with a
+20-second idle timeout *on purpose*, to churn the storage-path registry — which arranged for the
+engine to restart repeatedly, and would have made any crash indistinguishable from the known
+upstream shape. The `steady` arm now holds one connection open for the whole window, taken
+before the pool exists and released after the last worker stops, outside the pool so that no
+pool setting can retire it. Measured on a three-minute steady run:
+
+```
+engine-floor samples (every 5 ms)                          29257
+of those, zero connections open (engine down)                  0
+engine restarts observed (0 -> 1 transitions)                  0
+lowest connection count seen                                   3
+```
+
+and the verdict fails a steady run that ever reaches zero, so this cannot quietly stop being
+true.
+
+**`--arm pool-drain` keeps the dangerous shape, deliberately and separately**, because it is
+what real users hit: `minimumIdle=0` is the ordinary setting for a low-traffic service, and
+after a lull the pool releases everything and the next request restarts the engine. The arm
+cycles ten seconds of load against five of quiet against a one-second idle timeout, so the pool
+really empties. A crash there is the known upstream hazard, not a driver defect, and it is
+labelled so nobody has to guess. `docs/unsupported.md` tells users to keep `minimumIdle >= 1`
+and why.
+
+**The integration suite is inside that shape too**, which is worth writing down. `HikariPoolIT`
+uses `minimumIdle(0)` and builds a fresh pool per test method inside try-with-resources, so each
+method closes every connection it opened — one engine boot and teardown apiece, and the suite
+runs every IT class in one JVM per JDK. It is green today, so the accumulated churn is evidently
+below upstream's threshold, but it is the first thing to look at if the suite ever starts dying
+with a signal and no `hs_err`.
+
+**And it gives a way to tell the two crash modes apart**, which matters for the one crash this
+work produced (below):
+
+| | issue #14, the signal window | upstream allocator corruption |
+|---|---|---|
+| Signal | SIGSEGV or SIGBUS, whatever HotSpot handles for itself | abort — SIGABRT |
+| Crash report | **none**, because the handler that writes it is the one that was removed | normal: `hs_err` or an `.ips` |
+| Needs | concurrent `chdb_connect` calls | repeated engine restarts plus accumulated state |
+| Corroborated by | `run-signal-window-test.sh measure` reporting a non-zero count | engine restarts observed > 0 |
+
+**The mix**, weighted rather than uniform, because the shapes cost between a millisecond and
+several seconds and a uniform draw would spend the window on the expensive ones:
+
+| Shape | What it is for |
+|---|---|
+| `stream-full` | a streamed `SELECT` read to exhaustion, 20k–200k rows, row count asserted |
+| `stream-early-close` | `close()` on a result set with a hundred million rows left to produce |
+| `cascade-close` | `Connection.close()` with an open `Statement` and `ResultSet` under it, unpooled |
+| `materialized` | `SHOW`, `DESCRIBE`, `EXPLAIN`, `EXISTS`: the `chdb_query_arrow_n` route |
+| `prepared` | `PreparedStatement` with four bound parameters |
+| `ddl-dml` | `CREATE` / `INSERT` / `SELECT` / `TRUNCATE`: the no-result-set route |
+| `error` | a statement the engine rejects, then a query on the same connection |
+| `metadata` | `DatabaseMetaData.getTables` and `getColumns`, which run their own queries |
+| `cancel` | `Statement.cancel()` from another thread, 40–240 ms into a fetch |
+| `timeout-stream` | `setQueryTimeout(1)` expiring during `next()` |
+| `timeout-open` | `setQueryTimeout(1)` expiring inside the uninterruptible open |
+
+**And it watches `phys_footprint`, not only RSS.** On this platform RSS is actively misleading:
+it counts engine image pages as they are faulted in, and does not count pages the compressor
+has taken, so it stepped *down* 120 MB two minutes into the calibration run while the process
+was getting busier. `phys_footprint` — the kernel's ledger of what is charged to the task — sat
+flat within 2 MB across the same stretch. On Linux the column is `Pss` from `smaps_rollup`,
+which is the number work plan §5.11 actually names.
+
+**What the run measured.** 75 minutes, eight workers, `jdbc:chdb::memory:`, everything above in
+the mix. Slope and ceiling are both over the last 80% of the window, because the engine warms up
+in the first fifth — it faults in its image, fills its caches and settles — and a statistic that
+includes warm-up measures warm-up:
+
+| Series | Slope | Ceiling, first half → second half |
+|---|---|---|
+| RSS | −68.88 MB/h | 572.53 → 560.17 MB (**−12.36**) |
+| `phys_footprint` | +93.42 MB/h | 589.47 → 593.38 MB (**+3.91**) |
+| JVM heap used | +28.04 MB/h | 306.13 → 306.83 MB (+0.70), against a 512 MB cap |
+| Native handles | +0.27/h | 15 → 16, and **0/0/0 after the pools closed** |
+
+482,442 iterations, 12,489,675,470 rows read, **zero unexpected failures**, and every shape in
+the mix ran: 105,848 full streams, 86,659 materialized reads, 67,813 early closes, 67,194
+unpooled cascading closes, 48,427 parameterised statements, 29,189 DDL/DML cycles, 29,119
+rejected statements, 23,966 cancels that actually cancelled, 9,722 timeouts that fired during
+`next()`, 9,577 that fired on the open's deadline, 4,928 `DatabaseMetaData` sweeps.
+
+**Why the ceiling and not the slope, which is a correction.** The harness originally asserted a
+least squares slope, and this run failed it: `phys_footprint` fitted at **+93.42 MB/h** against
+a 25 MB/h threshold, while RSS over the same window *fell* at 68.88 MB/h and the handle count
+was flat. Investigating rather than raising the threshold showed the fit was the problem.
+
+Here is the series that failed it, as two-minute means in MB:
+
+```
+  0m 472   2m 522   4m 584   6m 590   8m 595  10m 531
+ 12m 581  14m 551  16m 524  18m 486  20m 483  22m 482
+ 24m 472  26m 486  28m 474  30m 470  32m 519  34m 583
+ 36m 584  38m 587  40m 589  42m 589  44m 589  46m 592
+ 48m 592  50m 592  52m 592  54m 593  56m 593  58m 593
+ 60m 542  62m 543  64m 587  66m 541  68m 527  70m 554
+ 72m 585  74m 585
+```
+
+That is not growth and it is not a warm-up step. It is **a cache filling to a ceiling, being
+trimmed, and refilling to the same ceiling** — 595 at minute 8, down to 470 by minute 30, back
+to 592–593 and sitting there from minute 46 to 58, then wobbling. The high-water mark is stable
+to about a megabyte across the whole run. A least squares fit over a window that happens to
+start in the trough (minutes 15–30) and end on the plateau (minutes 58–75) *must* come out
+positive; it is measuring where the trim fell relative to the window boundaries. Same data,
+three windows:
+
+```
+whole run    +46.48 MB/h
+last 80%     +93.42 MB/h     <- what the run was failed on
+last 50%     -68.16 MB/h     <- the opposite conclusion
+```
+
+**So why is the ceiling the right statistic, and does it still catch a slow leak?** Yes, and
+better than the slope, for three reasons.
+
+1. *A leak raises the ceiling by construction.* Leaked bytes are not returned by a trim, so they
+   sit under everything the cache holds. The moment the cache is full is the moment leaked bytes
+   are most visible, not least — the maximum is where a leak shows up first.
+2. *Its noise floor is far tighter.* Across two independent long runs the ceiling moved −12.4
+   and +3.9 MB, while the slope on the *same* series ranged from −68 to +93 MB/h depending only
+   on where the window was cut. A criterion is only as sensitive as its noise, and the ceiling's
+   is roughly twenty times smaller.
+3. *It is not sensitive to window placement at all*, which is what made the slope unusable here:
+   the trim cycle is minutes to tens of minutes long, comparable to the window itself.
+
+**Its sensitivity, stated rather than assumed.** A leak is caught when it lifts the ceiling more
+than the 32 MB threshold *within the window*. At the 482,442 iterations this run did in 75
+minutes that is about **70 bytes per iteration**. Below that the memory ceiling will not see it
+on an hour-long window — a 5-byte-per-iteration leak needs roughly seven hours to lift the
+ceiling 32 MB — which is precisely what the work plan's "one to six hours" is for, and why a
+release runs the longest window it can afford rather than the shortest that passes.
+
+What covers the gap under 70 bytes an iteration is the handle counter, which is why it is the
+primary signal: a leaked `ResultSet`, `Statement` or `Connection` is caught at *any* size,
+because it is counted rather than weighed, and the end-of-run check that all three counts are
+zero has no threshold at all. A leak that leaks memory but no handle, at under 70 bytes an
+iteration, is the one thing this gate would need a multi-hour window to see. That is a real
+limitation and it is recorded here rather than papered over.
+
+Highest value in the first half of the fit window against the highest in the second, on the
+recorded series:
+
+```
+75-minute clean run       rss  -12.4 MB   phys_footprint   +3.9 MB   handles  +1
+10-minute clean run       rss   +0.2 MB   phys_footprint  -34.2 MB   handles  +2
+10-minute leak fault, 1   rss  +51.1 MB   phys_footprint +234.1 MB   handles +41
+10-minute leak fault, 2   rss  +27.3 MB   phys_footprint  +67.0 MB   handles +33
+```
+
+A separation that, unlike the slope, does not depend on window placement. The threshold is
+32 MB: eight times above the largest clean measurement, and two to seven times below the fault
+depending on where in its own oscillation the leak run happens to end. At 482,442 iterations per
+75 minutes it is still enough to catch a leak of about 70 bytes an iteration.
+
+The spread between the two fault runs is the reason the handle counter carries most of the
+weight and the memory ceiling is a backstop rather than the primary signal: 32 MB is a
+comfortable margin against a leak of engine memory and a thin one against a leak of only a few
+tens of megabytes.
+
+**The handle thresholds were wrong for the same reason, and it took a second failing run to
+see it.** The handle slope started at 0.50/h — "half a handle an hour, surely generous" — and a
+clean 66-minute run failed it at **+0.53/h**, with both memory ceilings falling, zero unexpected
+failures, and handles back to 0/0/0 at the end. The live count is not monotone either: the pool
+opens and evicts connections on its own schedule, so it wanders between 7 and 17 across a
+window. For a counter swinging by ten over fifty minutes with 69 samples, one standard error on
+the fitted slope is about 1.4/h — so a 0.50/h threshold sat well inside the statistic's own noise
+and was always going to flake. Measured over every run long enough to fit:
+
+```
+clean, 66 minutes     slope   +0.53/h    ceiling 14 -> 17  (+3)
+clean, 75 minutes     slope   +0.27/h    ceiling 15 -> 16  (+1)
+clean, 10 minutes     slope  -10.24/h    ceiling            (+2)
+leak fault, run 1     slope +410.19/h    ceiling 55 -> 96  (+41)
+leak fault, run 2     slope +560.29/h    ceiling 70 -> 103 (+33)
+```
+
+So the slope threshold is 25/h — about eighteen standard errors above the noise and sixteen
+times below the smallest fault — and a handle *ceiling* threshold of 16 was added alongside it,
+five times above the largest clean rise and twice below the smallest fault. Both are asserted,
+because each covers the other's blind spot: the ceiling is deaf to a slow climb that never
+exceeds the pool's high-water mark, and the slope is noisy on a counter that swings by ten.
+
+Neither is the primary defence. That is the unconditional check that all three handle counts are
+zero once the pools have closed — no threshold to get wrong, the same assertion `NativeTestBase`
+makes after every test, and the one the leak fault failed at 45/0/45. The window statistics
+exist to catch a leak that something happens to clean up before the end.
+
+The slopes are still computed and printed, because they are the right first thing to look at
+when something has moved; for memory they are diagnostics rather than the gate.
+
+**Two corrections is the honest count.** Both were the same mistake — a threshold picked by
+intuition on a statistic whose noise had not been measured — and both were caught by a clean run
+failing rather than by a dirty one passing, which is the safe direction for that mistake to go.
+Every recorded series was re-judged under the final thresholds with `--analyze`: all four clean
+runs pass, both leak faults fail on the memory ceiling *and* the handle ceiling, and the two
+stall runs fail on having too few samples to fit, which is what they should say — they are
+judged by exiting 3, not by a regression.
+
+**The order of events**, because a threshold changed after a failing run deserves it:
+
+1. a 75-minute window ran and produced the series above; it failed the memory criterion the
+   harness shipped with at the time;
+2. the memory criterion was changed to the ceiling, and the three fault modes re-run under it;
+3. a 66-minute window ran and came back clean on memory — and failed the handle *slope* at
+   +0.53/h against 0.50/h;
+4. the handle thresholds were corrected the same way, and every recorded series re-judged.
+
+`scripts/run-soak-test.sh --analyze <dir>` is what re-judges a recorded `samples.csv`. It exists
+because the series is the evidence and a threshold is a judgement about it, and those change on
+different schedules — so a correction like this one does not need the run repeated to find out
+what the new statistic says about the old data, and a CI artifact from three weeks ago stays
+worth reading.
+
+**The two long windows in numbers**, so nothing above has to be taken on trust:
+
+| | 75 minutes | 66 minutes |
+|---|---|---|
+| Iterations | 482,442 | 132,633 |
+| Rows read | 12,489,675,470 | 3,462,714,985 |
+| Unexpected failures | 0 | 0 |
+| Handles after the pools closed | 0/0/0 | 0/0/0 |
+| RSS ceiling | −12.36 MB | −2.39 MB |
+| `phys_footprint` ceiling | +3.91 MB | −105.02 MB |
+| Handle ceiling | +1 | +3 |
+| Handle slope | +0.27/h | +0.53/h |
+
+The 66-minute run did a quarter of the iterations of the 75-minute one for the same wall clock,
+because the host it ran on was contended: two five-minute windows where throughput collapsed
+appear in its `samples.csv` as 320-second and 313-second gaps between samples. Worth recording
+for two reasons. The memory series was unaffected — RSS moved 0.2 MB across the first gap — and
+the watchdog correctly stayed quiet, because every worker kept completing iterations through it.
+Slow is not stuck, and a progress counter is what can tell the difference.
+
+**Deadlock detection is a progress counter, not the run timeout.** A run killed by its own
+deadline tells you it hung and nothing else. Each worker bumps a counter per iteration and a
+watchdog checks every ten seconds that all of them have moved inside the stall window; on a
+stall it dumps every Java thread and every native frame and exits 3. It also polls
+`ThreadMXBean.findDeadlockedThreads`, which is immediate but sees only monitor cycles — it
+cannot see a `StatementSlot` semaphore or a `std::mutex` in the shim, which is what the
+progress counter is for.
+
+**The harness was shown to go red before the clean run was believed.** A soak that has never
+failed proves only that the process did not crash, so all three detectors were driven by an
+injected fault, and `soak.yml` re-drives them weekly and checks that each fails for its own
+reason rather than merely failing:
+
+| `--fault` | What it does | What caught it, measured |
+|---|---|---|
+| `leak-resultset` | abandons one `Connection` + `Statement` + `ResultSet` every 40 iterations, 45 of them over ten minutes | three signals, independently: **45/0/45 handles open after the pools closed**, a `phys_footprint` ceiling rise of **+66.98 MB** against the 32 MB threshold, a handle slope of **+560.29/h** against 25/h, and a handle ceiling rise of **+33** against 16. Exit 2. Worth noting what did *not* catch it: the RSS ceiling rose 27.31 MB, under the 32 MB threshold. `phys_footprint` is the column carrying the memory signal, which is the whole argument for paying a second per sample to collect it |
+| `stall-worker` | parks worker 0 forever mid-iteration, holding nothing | the progress counter, at 60 s: worker 0 stuck at iteration 59 while the other seven were at 856–1300. `findDeadlockedThreads` saw nothing, correctly — a `CountDownLatch` park is not a monitor cycle — which is the case the counter exists for. Exit 3 |
+| `deadlock` | two workers take two monitors in opposite orders, through a barrier so the cycle is certain rather than lucky | `findDeadlockedThreads`, inside ten seconds, and the dump named it: `soak-worker-0 BLOCKED on java.lang.Object@5878515f owned by "soak-worker-1"` and the mirror image. Exit 3 |
+
+All three were re-run after the criterion below changed, so those are the numbers the harness as
+committed produces, not the ones that motivated the change.
+
+Both stall paths also write `stall-native-sample.txt` — 348 KB and 404 KB of native frames from
+macOS `sample` — because Java frames name the JNI entry point and stop there. A lock-order bug
+in the shim looks like a thread sitting in `ChdbNative.streamAdvance` and nothing more; the
+native stack is where `StreamHandle::mutex` waiting on `ConnHandle::mutex` would be visible.
+
+**What the soak found, and why this row is still blocking.** One attempt at a long window did
+not finish. It died between its 60-second and 75-second samples with `Bus error: 10` — exit 138
+— and no `hs_err` file, no macOS `.ips` report and nothing in `/cores`.
+
+**Attribution, carefully, because there are two candidates and that run cannot fully separate
+them.** It was made with the *first* version of this harness, the one configured
+`minimumIdle=0` — so it was in the engine-restart shape described above, and the
+connection-count instrumentation that would have said whether the engine actually restarted did
+not exist yet. So upstream allocator corruption cannot be excluded from that run.
+
+What points at issue #14 rather than at allocator corruption is the signature. The crash was
+SIGBUS and produced no crash report of any kind; allocator corruption is documented upstream as
+an *abort*, which arrives as SIGABRT with the host handlers intact and therefore writes a report.
+A missing report is #14's defining feature — HotSpot writes `hs_err` from the handler that the
+opt-out removed. And `scripts/run-signal-window-test.sh measure` on the same build and engine
+confirms that window is open, at 614–707 observations of a host handler at `SIG_DFL` per run.
+The soak drives it harder than anything else here: a connection per query is around a hundred
+`chdb_connect()` calls a second, each of which resets `SIGSEGV`, `SIGBUS` and six more to
+`SIG_DFL` process-wide until the shim restores them.
+
+So: **most likely #14, not provably only #14.** The table above is how a recurrence gets
+classified in one step now, and the steady arm's zero-restart measurement is what makes that
+classification possible.
+
+If it is #14, the new part is not the mechanism, which
+[findings §1a](upstream-findings.md) already documents. It is that **no synthetic signal
+generator was involved.** §1a's lethal demonstration needed eight threads deliberately producing
+stack-guard SIGSEGVs; this was an ordinary mixed workload, and ordinary JIT-compiled code
+supplied the faults by itself. That would make the exposure "a pooled application that opens
+connections at a normal rate can be killed silently, with no diagnostic" rather than "a stress
+harness can provoke it".
+
+Nothing in this repository closes it — the fix is an upstream API that sets the opt-out flag
+without resetting the incumbent handlers — so **this is a release decision rather than a bug to
+fix here**, and it is why the row above still says blocking. The options, none of them taken
+yet:
+
+- ship with it documented, since the driver already takes the lesser of two hazards and §1a
+  explains why the alternative is three orders of magnitude worse;
+- reduce the number of windows further by making connection churn rarer in the *documented*
+  usage — a pool with `minimumIdle` equal to `maximumPoolSize` opens each connection once,
+  which is a README recommendation rather than a code change;
+- wait for upstream.
+
+`scripts/run-soak-test.sh` now names the signature itself when a run dies this way, rather than
+leaving an operator with exit 138 and no explanation.
 
 ### 3.2 Not blocking — worth doing, in this order
 
@@ -443,12 +799,22 @@ them found real defects when first run.
 
 ## The short answer
 
-**Not ready, and the gating items are not code.** Everything mechanical is finished: the release
-profile, the signing, the licence inventory, the four-platform assembly, and a local proof that
-the artifacts work when consumed from a repository rather than from the reactor.
+**Not ready. Most of the gating items are not code — but one of them now is.** Everything
+mechanical is finished: the release profile, the signing, the licence inventory, the
+four-platform assembly, and a local proof that the artifacts work when consumed from a
+repository rather than from the reactor.
 
 What is left is a DNS record on `chdb.org`, a decision about whose key signs, a licence answer
-from whoever owns the engine, two projects willing to depend on a snapshot, and a concurrent
-soak. The **Running order** at the top of this file is the sequence, because each of those can
-invalidate the next; §3.1 is the part of Track 3 that blocks, and §3.2 is the part that does
-not.
+from whoever owns the engine, and two projects willing to depend on a snapshot. The
+**Running order** at the top of this file is the sequence, because each of those can invalidate
+the next; §3.1 is the part of Track 3 that blocks, and §3.2 is the part that does not.
+
+The soak is no longer on that list in the same way. It is written, it has been run for 75
+minutes, and it comes back clean on memory, handles and deadlocks — but it also killed the JVM
+once, inside its first two minutes, with no crash report of any kind — most likely issue #14's
+silent signal window, though that run predates the instrumentation that would have ruled out the
+other candidate. Either way it is an engine-level hazard.
+That is not a defect in this repository and cannot be fixed here, so it is not a task; it is a
+**decision about what to ship and what to tell people**, and §3.1.1 lays out the three options.
+Of everything on this page it is the one that changes what a user experiences rather than what a
+maintainer has to do.

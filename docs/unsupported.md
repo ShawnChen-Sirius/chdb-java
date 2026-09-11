@@ -240,6 +240,54 @@ does not belong to connection handle 18576`, once in 11 860 soak iterations. A r
 connection is closed underneath it now says so, with SQLSTATE `08003`; a read whose result set
 was closed underneath it says that, with `HY010`.
 
+**With a connection pool, keep `minimumIdle` at 1 or more.** This one is a configuration rule
+rather than an API rule, and the default many people reach for is the wrong one.
+
+The engine is booted by the connection that finds none open and torn down by the last one to
+close — that is what "the `:memory:` database lives until the last connection closes" means, and
+it is measurable: `scripts/run-soak-test.sh` samples the live connection count every 5 ms and
+counts the transitions back up from zero, which are engine restarts. A pool configured with
+`minimumIdle=0` will, after an idle period, evict every connection it holds; the next request
+then boots the engine again. So a low-traffic service with the pool sized to release resources
+when quiet does not merely reconnect between bursts, it **restarts the embedded engine** between
+them.
+
+That is a hazard, not just a cost. chdb-core's own test runner records that "starting and
+tearing the embedded engine down on every connection repeatedly can corrupt the process
+allocator and abort under load on macOS", and it is built around avoiding it: any test that
+opens a non-`:memory:` path gets a process to itself, and the rest are split across four
+processes "so that no single process accumulates the whole suite's engine create/destroy churn".
+Their measurements say it needs both accumulated state *and* repeated restarts — a bare
+restart loop did not reproduce it in 30, 40 or 25 attempts, while two state-accumulating suites
+sharing one process crashed 1 time in 10, and each alone crashed 0 in 10. A long-lived service
+that restarts the engine on every traffic lull is a good match for "accumulated state plus
+repeated restarts".
+
+So:
+
+```java
+HikariConfig config = new HikariConfig();
+config.setJdbcUrl("jdbc:chdb:/var/lib/chdb");
+config.setMaximumPoolSize(8);
+config.setMinimumIdle(1);        // never drain to zero: 0 restarts the engine on every lull
+```
+
+`minimumIdle=1` is enough — one surviving connection keeps the engine up, and everything else
+about the pool can churn freely. If your pool cannot guarantee a floor (note that HikariCP's
+default `maxLifetime` is 30 minutes, so a pool can briefly reach zero when its last connection
+is retired), hold one connection yourself for the lifetime of the application, outside the pool.
+That is what chdb-core's own ADBC verification suite does — a session-scoped fixture holding one
+connection, commented *"chDB is embedded: hold one connection for the whole session so the
+in-memory instance survives across modules"* — and it is what the soak's steady arm does, for
+the same reason.
+
+**This is an engine-level constraint, not a driver defect**, and nothing in the driver can fix
+it: the driver cannot keep an engine alive that the C ABI tears down when the last connection
+closes, and it must not hold a connection open on the application's behalf. What it can do is
+make the situation observable, which is what the connection-count instrumentation in the soak
+is for. `docs/release-readiness.md` §3.1.1 has the numbers, including a `pool-drain` arm that
+runs this shape on purpose.
+
 **Stop your query threads before the JVM exits.** The driver installs a shutdown hook that
 closes connections the application forgot, which covers a leaked result set: without it, a JVM
 exiting with a streaming `ResultSet` open aborts inside the engine (SIGABRT, exit 134) rather
